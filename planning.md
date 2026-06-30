@@ -32,7 +32,9 @@ A moderator (out of scope for v1) would later review appeals manually. Automated
 ---
 
 ## Architecture
-Generated architecture of plan
+
+Submission flow: a platform POSTs text to `/submit`, which passes rate limiting, runs both detection signals, combines them into a confidence score, selects a transparency label, writes a structured audit log entry, and returns the full result. Appeal flow: a creator POSTs a `content_id` and reasoning to `/appeal`, which updates the content status to `under_review` and appends an appeal event to the audit log.
+
 ```
 ┌─────────────┐     POST /submit      ┌──────────────┐
 │   Platform  │ ────────────────────► │ Rate Limiter │
@@ -274,6 +276,24 @@ Simple health check. Returns `{ "status": "ok" }`.
 
 ## Appeals Workflow
 
+### Who Can Appeal
+Any creator who received a classification for their content. They must provide the `content_id` returned by `/submit` and a free-text `creator_reasoning` field explaining why they believe the classification is wrong.
+
+### What Happens on Appeal
+1. Creator calls POST /appeal with `content_id` and `creator_reasoning`.
+2. System validates content_id exists and status is `classified` (not already under review).
+3. Content status updated to `under_review` in the content store.
+4. A new audit log entry (event_type: `appeal`) is appended with the appeal reasoning, linked to the original classification by `content_id`.
+5. Response confirms the appeal was received with status `under_review`.
+
+### What a Human Reviewer Sees
+A reviewer opening the appeal queue (via GET /log filtered by status) would see:
+- The original classification entry: attribution, confidence, both signal scores, transparency label, timestamp
+- The appeal entry: creator's reasoning, timestamp, current status `under_review`
+- The original submitted text (stored in the content table)
+
+The reviewer decides manually — no automated re-classification in v1.
+
 ### Normal Flow
 1. Creator receives a classification they disagree with.
 2. Creator calls POST /appeal with content_id and free-text reasoning.
@@ -335,15 +355,45 @@ provenance-guard/
 
 ---
 
+## Anticipated Edge Cases
+
+1. **Repetitive poetry with simple vocabulary** — A haiku or spoken-word poem with short, uniform lines and limited vocabulary will score high on stylometric uniformity (low sentence-length variance, low type-token ratio) even when written by a human. The LLM signal may also flag the polished phrasing. Result: likely `uncertain` label due to signal disagreement or mid-range scores — not a false "likely AI" if confidence gate works.
+
+2. **Lightly edited AI output** — A user runs ChatGPT output through minor manual edits (changing a few words, adding a personal anecdote). The LLM signal may still detect AI patterns while stylometrics look more human. Signal disagreement lowers confidence → `uncertain` label, avoiding a harsh false positive.
+
+3. **Non-native English formal writing** — A non-native speaker writing carefully correct, uniform sentences may score as AI-like on both signals. The appeals workflow is the safety valve — the creator can explain their background and request manual review.
+
+4. **Very short text (< 20 words)** — Insufficient sentences for reliable stylometric variance. Stylometric signal returns a neutral 0.5 with reduced weight; combined confidence stays low → `uncertain` label.
+
+---
+
 ## AI Tool Plan
 
-| Milestone | AI Tool Use | Input Provided | Expected Output |
-|---|---|---|---|
-| **Milestone 2: Core Implementation** | Generate Flask route boilerplate, SQLite schema, and stylometric heuristic functions | Architecture diagram, API surface spec, signal descriptions from this document | Working app.py, storage.py, detector.py skeletons — will review and adjust weights/thresholds manually |
-| **Milestone 3: Integration & Testing** | Generate test curl commands and sample audit log entries for README demo section | API response schemas, threshold table, label variants | Demo commands and example JSON — will run each command myself and verify output matches spec |
-| **Milestone 4: README & Docs** | Draft README sections (known limitations, spec reflection, AI usage log) | Completed implementation notes, threshold decisions, test results | README prose — will rewrite in my own voice and add specific examples from my actual testing |
+### M3 — Submission Endpoint + First Signal
+
+| Item | Detail |
+|---|---|
+| **Spec sections provided** | Detection Signals (Signal 1), Architecture diagram, API Surface (POST /submit) |
+| **Ask AI to generate** | Flask app skeleton with POST /submit route stub; `analyze_llm()` function calling Groq with structured prompt returning 0.0–1.0 score; SQLite audit log helper |
+| **Verification** | Run Flask app; curl POST /submit with sample text; confirm JSON response has content_id, attribution, confidence placeholder; call GET /log and confirm structured entry with llm_score and timestamp |
+
+### M4 — Second Signal + Confidence Scoring
+
+| Item | Detail |
+|---|---|
+| **Spec sections provided** | Detection Signals (Signal 2 + combination formula), Confidence Scoring & Uncertainty (thresholds), Architecture diagram |
+| **Ask AI to generate** | `analyze_stylometric()` function; `score_content()` combining both signals per the 0.6/0.4 formula; attribution logic using threshold table |
+| **Verification** | Test 4 inputs (obvious AI, obvious human, formal human, edited AI); print both signal scores; confirm clearly different ai_probability values; confirm at least 3 label categories are reachable |
+
+### M5 — Production Layer
+
+| Item | Detail |
+|---|---|
+| **Spec sections provided** | Transparency Labels (all 3 variants verbatim), Appeals Workflow, Rate Limiting table, Architecture diagram |
+| **Ask AI to generate** | `generate_label()` mapping scores to label text; POST /appeal endpoint; Flask-Limiter on /submit |
+| **Verification** | Submit inputs producing each of 3 label variants; POST /appeal with saved content_id; GET /log shows appeal with status under_review; run 12 rapid submits and confirm 429 after 10 |
 
 **What I will NOT delegate to AI:**
-- Threshold and weight decisions (0.6/0.4 split, 0.75/0.25 cutoffs) — these are design choices informed by the false-positive analysis above.
-- Transparency label wording — will test phrasing with a non-technical reader before finalizing.
-- Rate limit values — tied to realistic platform usage patterns, not defaults.
+- Threshold and weight decisions (0.6/0.4 split, 0.75/0.25 cutoffs)
+- Transparency label wording
+- Rate limit values
